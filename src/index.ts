@@ -26,6 +26,7 @@ interface UserState {
     category?: string;
     urgency?: string;
     description?: string;
+    fullDescription?: string;
 }
 const userSessions: Record<string, UserState> = {};
 const pendingJobs: Record<string, any> = {};
@@ -80,8 +81,8 @@ async function processAudioWithAI(mediaId: string): Promise<{ summary: string, f
         const writer = fs.createWriteStream(tmpFilePath);
         downloadRes.data.pipe(writer);
 
-        await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
+        await new Promise<void>((resolve, reject) => {
+            writer.on('finish', () => resolve());
             writer.on('error', reject);
         });
 
