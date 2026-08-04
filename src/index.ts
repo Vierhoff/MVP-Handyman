@@ -97,14 +97,24 @@ app.post('/webhook', async (req, res) => {
                 return;
             }
 
-            const from = message.from; // Número del remitente (ej: 54911...)
+            let from = message.from; // Número del remitente (ej: 54911...)
+            // FIX ARGENTINA: Meta rechaza el '9' y exige el '15' para cuentas de prueba
+            if (from.startsWith('54911')) {
+                from = from.replace('54911', '541115');
+            }
+
             const text = message.text.body.trim();
             const textLower = text.toLowerCase();
 
             console.log(`Mensaje recibido de ${from}: ${text}`);
 
+            let profNumber = MOCK_PROFESSIONAL_NUMBER;
+            if (profNumber && profNumber.startsWith('54911')) {
+                profNumber = profNumber.replace('54911', '541115');
+            }
+
             // --- FLUJO DEL PROFESIONAL (Simulado) ---
-            if (MOCK_PROFESSIONAL_NUMBER && from === MOCK_PROFESSIONAL_NUMBER && textLower.startsWith('aceptar')) {
+            if (profNumber && from === profNumber && textLower.startsWith('aceptar')) {
                 const jobId = text.split(' ')[1]; // Ej: ACEPTAR 54911...
                 if (jobId && pendingJobs[jobId]) {
                     const job = pendingJobs[jobId];
