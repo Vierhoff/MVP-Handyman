@@ -2,6 +2,10 @@ import express from 'express';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import localtunnel from 'localtunnel';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import OpenAI from 'openai';
 
 dotenv.config();
 
@@ -52,6 +56,79 @@ async function sendMessage(to: string, text: string) {
         );
     } catch (error: any) {
         console.error("Error enviando mensaje a Meta:", error.response?.data || error.message);
+    }
+}
+
+const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
+
+async function processAudioWithAI(mediaId: string): Promise<{ summary: string, fullText: string }> {
+    if (!openai) return { summary: "[🎤 Audio recibido - Falta OPENAI_API_KEY]", fullText: "[Falta OPENAI_API_KEY]" };
+    if (!WHATSAPP_TOKEN) return { summary: "[Error de Token]", fullText: "" };
+
+    try {
+        const mediaRes = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` }
+        });
+        const mediaUrl = mediaRes.data.url;
+
+        const downloadRes = await axios.get(mediaUrl, {
+            headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}` },
+            responseType: 'stream'
+        });
+
+        const tmpFilePath = path.join(os.tmpdir(), `${mediaId}.ogg`);
+        const writer = fs.createWriteStream(tmpFilePath);
+        downloadRes.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+
+        const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(tmpFilePath),
+            model: 'whisper-1'
+        });
+        
+        fs.unlinkSync(tmpFilePath);
+
+        const rawText = transcription.text;
+
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: "Eres un asistente de oficios. El cliente explicó su problema por audio. Resume el problema y extrae la dirección/zona en máximo 2 oraciones claras para que el trabajador sepa qué hacer y dónde ir." },
+                { role: "user", content: rawText }
+            ]
+        });
+
+        return { 
+            summary: completion.choices[0].message.content || rawText, 
+            fullText: rawText 
+        };
+    } catch (error: any) {
+        console.error("Error procesando audio con IA:", error.message);
+        return { summary: "[🎤 Audio recibido - Error al transcribir]", fullText: "" };
+    }
+}
+
+async function summarizeTextWithAI(rawText: string): Promise<{ summary: string, fullText: string }> {
+    if (!openai || rawText.length < 100) return { summary: rawText, fullText: rawText };
+    try {
+        const completion = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                { role: "system", content: "Eres un asistente de oficios. El cliente escribió su problema. Resume el problema y la dirección en máximo 2 oraciones claras para el trabajador. Si ya es breve, déjalo igual." },
+                { role: "user", content: rawText }
+            ]
+        });
+        return { 
+            summary: completion.choices[0].message.content || rawText, 
+            fullText: rawText 
+        };
+    } catch (error) {
+        console.error("Error resumiendo texto:", error);
+        return { summary: rawText, fullText: rawText };
     }
 }
 
@@ -128,7 +205,7 @@ app.post('/webhook', async (req, res) => {
                 const jobId = text.split(' ')[1]; // Ej: ACEPTAR 54911...
                 if (jobId && pendingJobs[jobId]) {
                     const job = pendingJobs[jobId];
-                    await sendMessage(from, `✅ Has aceptado el trabajo de ${job.category} para el cliente ${job.name}.\n\nComunícate con el cliente al wa.me/${jobId}`);
+                    await sendMessage(from, `✅ Has aceptado el trabajo de ${job.category} para el cliente ${job.name}.\n\nComunícate con el cliente al wa.me/${jobId}\n\n*Mensaje original del cliente:*\n"${job.fullDescription || job.description}"`);
                     
                     // Avisar al cliente
                     await sendMessage(jobId, `¡Buenas noticias! 🎉 Un profesional ha aceptado tu solicitud.\nSe pondrá en contacto contigo a la brevedad.`);
@@ -195,7 +272,20 @@ app.post('/webhook', async (req, res) => {
                     break;
 
                 case 3: // Recibe descripción
-                    session.description = text;
+                    if (message.type === 'audio') {
+                        await sendMessage(from, `⏳ *Escuchando tu audio...* (Procesando con IA)`);
+                        const result = await processAudioWithAI(message.audio.id);
+                        session.description = result.summary;
+                        session.fullDescription = result.fullText;
+                    } else if (message.type === 'text') {
+                        const result = await summarizeTextWithAI(text);
+                        session.description = result.summary;
+                        session.fullDescription = result.fullText;
+                    } else {
+                        session.description = '[📹 Video recibido - Pendiente de procesar]';
+                        session.fullDescription = 'Video';
+                    }
+
                     session.step = 4;
                     const resumen = `📋 *Resumen de tu solicitud:*\n\n👤 *Nombre:* ${session.name}\n🛠️ *Servicio:* ${session.category}\n⏱️ *Urgencia:* ${session.urgency}\n📝 *Detalle:* ${session.description}\n\n¿Deseas enviar esta solicitud a nuestra red de profesionales?\n\n1️⃣ Sí, enviar solicitud\n2️⃣ Cancelar y volver al inicio`;
                     await sendMessage(from, resumen);
@@ -207,13 +297,14 @@ app.post('/webhook', async (req, res) => {
                             name: session.name,
                             category: session.category,
                             urgency: session.urgency,
-                            description: session.description
+                            description: session.description,
+                            fullDescription: session.fullDescription
                         };
                         await sendMessage(from, `✅ ¡Solicitud enviada con éxito!\n\nEstamos buscando un profesional disponible. Te notificaremos por este medio apenas uno acepte el trabajo.\n\n*(Escribe 'cancelar' si deseas anularla)*`);
                         
                         // Simular búsqueda enviando mensaje al profesional
                         if (profNumber) {
-                            await sendMessage(profNumber, `🚨 *¡NUEVO TRABAJO!* 🚨\n\n👤 *Cliente:* ${session.name}\n🛠️ *Rubro:* ${session.category}\n⏱️ *Urgencia:* ${session.urgency}\n📝 *Detalle y Zona:* ${session.description}\n\nPara aceptar este trabajo, responde exactamente con:\nACEPTAR ${from}`);
+                            await sendMessage(profNumber, `🚨 *¡NUEVO TRABAJO!* 🚨\n\n👤 *Cliente:* ${session.name}\n🛠️ *Rubro:* ${session.category}\n⏱️ *Urgencia:* ${session.urgency}\n📝 *Resumen:* ${session.description}\n\nPara aceptar este trabajo, responde exactamente con:\nACEPTAR ${from}`);
                         }
                         session.step = 5; // En espera
                     } else if (text === '2') {
