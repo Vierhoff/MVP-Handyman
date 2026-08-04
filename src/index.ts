@@ -76,6 +76,9 @@ app.get('/webhook', (req, res) => {
 // 2. Recepción de mensajes (Lo llama Meta cuando alguien escribe al bot)
 app.post('/webhook', async (req, res) => {
     const body = req.body;
+    console.log("=== RAW WEBHOOK PAYLOAD ===");
+    console.log(JSON.stringify(body, null, 2));
+    console.log("===========================");
 
     // Verificar si es un evento de WhatsApp
     if (body.object) {
